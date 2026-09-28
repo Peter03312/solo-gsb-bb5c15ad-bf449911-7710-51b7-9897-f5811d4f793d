@@ -64,6 +64,15 @@ UTC 时刻与是否逾期（暂停中截止时刻为空，提交后按提交时�
 评审人 ID 排序。重复配对、未知配对、同对同刻事件与非法状态转换一律返回 `422` 与
 结构化问题清单，不输出任何钟结果。
 
+`POST /decision-ranking` 提供**稿件共识顺序**：接收 `/assign` 的可行分配名单
+（稿件 -> 评审人）与评审人对其已评稿件的**严格排序票**，按 **Schulze 最强路径法**
+汇总为完整共识顺序。每人最多一票、票内稿件不得重复且必须属于其分配名单；允许只排
+部分稿件，**未同时出现在同一张票中的两稿不计入成对支持**。直接支持为将甲排在乙前
+的票数，仅**成对胜者**的直接支持可作为路径边，路径强度取沿途最小支持的最大值；
+甲对乙的路径强度更大时甲在前，无法区分时按稿件 ID 升序破同。响应返回确定的完整
+顺序与全部成对支持数；未知评审人、重复投票、票内重复稿件、稿件不属于其分配名单
+均返回 `422` 与结构化问题清单，不输出任何顺序。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -84,6 +93,7 @@ curl 直接访问 <http://localhost:8000> 即可（根路径返回服务信息�
 | http://localhost:8000/assign-roles | 分角色分配接口（POST） |
 | http://localhost:8000/conflict-audit | 资格审计接口（POST，只读） |
 | http://localhost:8000/review-clock | 评审工时钟重放接口（POST） |
+| http://localhost:8000/decision-ranking | 稿件共识顺序接口（POST，Schulze 最强路径） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/redoc | ReDoc 文档 |
 
@@ -990,6 +1000,103 @@ pending ──accept──▶ active ──pause──▶ paused ──resume─
 下班后、周末或节假日）时，计时段起点钳制到其后第一个工作瞬间（通常为当天/次一
 工作日 09:00）。
 
+### `POST /decision-ranking`（稿件共识顺序，Schulze 最强路径）
+
+接收 `/assign` 的**可行分配名单**（`assignments`：稿件 -> 评审人，与 `/assign`
+响应同构）与评审人对其**已评稿件**的严格排序票（`ballots`），按 Schulze 方法
+汇总出稿件的完整共识顺序。接口本身不做分配计算，服务无状态。
+
+投票规则：
+
+- **每人最多一票**：同一 `reviewer_id` 出现多张票即非法（`duplicate_ballot`）；
+- **票为严格排序**：`ranked_manuscript_ids` 从前到后表示从优到劣，同一稿件
+  在一张票中不得重复（`duplicate_manuscript_in_ballot`）；
+- **票内稿件必须属于其分配名单**：评审人只能对自己被分配到的稿件排序；
+  投票评审人不在分配名单中（`unknown_reviewer`）或票内稿件未分配给该评审人
+  （`manuscript_not_assigned`，稿件不属于任一分配名单时同样按此处理）均非法；
+- **允许只排部分稿件**（空列表视为弃权）：只有**同时出现在同一张票中**的两篇
+  稿件才产生成对支持，部分票不会在未同票的稿件之间臆造偏好。
+
+排名算法（Schulze 最强路径）：
+
+1. **直接支持** `d[甲][乙]`：把甲排在乙前的票数；
+2. **路径边**：仅当甲对乙构成成对胜者（`d[甲][乙] > d[乙][甲]`）时，直接支持
+   `d[甲][乙]` 才能作为「甲 -> 乙」的路径边（成对平票时两个方向都不成边）；
+3. **路径强度** `s[甲][乙]`：所有「甲 -> … -> 乙」路径中「沿途最小边权」的
+   **最大值**（Floyd–Warshall 闭包）；
+4. **排序**：`s[甲][乙] > s[乙][甲]` 时甲排在乙前；仍无法区分（含未获任何
+   成对支持的稿件）时按**稿件 ID 升序**破同。Schulze 的路径强度关系是无环弱序，
+   据此得到确定的完整全序。
+
+请求体：
+
+```json
+{
+  "assignments": [
+    {"manuscript_id": "m1", "reviewer_ids": ["r1", "r2"]},
+    {"manuscript_id": "m2", "reviewer_ids": ["r1", "r2"]},
+    {"manuscript_id": "m3", "reviewer_ids": ["r1", "r2"]}
+  ],
+  "ballots": [
+    {"reviewer_id": "r1", "ranked_manuscript_ids": ["m1", "m2", "m3"]},
+    {"reviewer_id": "r2", "ranked_manuscript_ids": ["m3", "m1"]}
+  ]
+}
+```
+
+字段规则：
+
+- `assignments`（必填，至少 1 条）：`/assign` 求出的可行分配名单；同一稿件
+  拆成多条或评审人重复时自动合并取并集。
+- `ballots`（可选，缺省为空）：每张票为 `{reviewer_id, ranked_manuscript_ids}`；
+  `ranked_manuscript_ids` 可只列该评审人分配名单内的部分稿件，空列表表示弃权。
+- 非法投票整体返回 `422`（可一次返回多条，按类型与 ID 确定性排序），此时不
+  输出任何顺序：
+
+| 问题类型 | 含义 |
+| --- | --- |
+| `unknown_reviewer` | 投票评审人不在分配名单中 |
+| `duplicate_ballot` | 同一评审人提交了多张票（每人最多一票） |
+| `duplicate_manuscript_in_ballot` | 单张票内同一稿件重复出现 |
+| `manuscript_not_assigned` | 票内稿件不属于该评审人的分配名单 |
+
+可行时响应（`200`）：`ranking` 为完整共识顺序（含未获票的稿件）；
+`pairwise_support` 列出**全部直接支持为正的有向对**（按
+`(manuscript_id, over_manuscript_id)` 字典序，未列出的有向对支持数为 0）。
+分配名单条目顺序与票的输入顺序重排不改变任何输出：
+
+```json
+{
+  "ranking": ["m1", "m2", "m3"],
+  "pairwise_support": [
+    {"manuscript_id": "m1", "over_manuscript_id": "m2", "support": 2},
+    {"manuscript_id": "m1", "over_manuscript_id": "m3", "support": 1},
+    {"manuscript_id": "m2", "over_manuscript_id": "m3", "support": 1},
+    {"manuscript_id": "m3", "over_manuscript_id": "m1", "support": 1}
+  ]
+}
+```
+
+上例说明：`r1` 票为 `m1>m2>m3`、`r2` 票为 `m3>m1`（部分票，`m2` 未与 `m3`
+同票，二者之间不计任何支持）；`m1` 对 `m2` 直接支持 2 居前，`m2` 与 `m3`
+之间路径强度互相为 0，按稿件 ID 破同为 `m2` 先于 `m3`。
+
+被拒绝时响应（`422`，`errors` 数组，形态与 `/review-clock` 的业务 422 一致；
+请求体字段本身不合法时为 FastAPI 校验形态 `detail`）：
+
+```json
+{
+  "errors": [
+    {
+      "type": "manuscript_not_assigned",
+      "reviewer_id": "r1",
+      "manuscript_id": "m2",
+      "detail": "稿件 m2 不在评审人 r1 的分配名单中，票内稿件必须属于其分配名单"
+    }
+  ]
+}
+```
+
 ### 示例调用
 
 ```bash
@@ -1152,6 +1259,23 @@ curl -s -X POST http://localhost:8000/review-clock \
       }'
 # -> status=active，worked_hours=3（周一 2h + 周二 1h，暂停与夜间不计）；
 #    恢复时剩 8h，周二计 7h 后跨节假日（周三）顺延，deadline=2026-09-24T10:00:00Z
+
+# 稿件共识顺序：Schulze 最强路径，部分票（未同票不计成对支持），ID 破同
+curl -s -X POST http://localhost:8000/decision-ranking \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "assignments": [
+          {"manuscript_id": "m1", "reviewer_ids": ["r1", "r2"]},
+          {"manuscript_id": "m2", "reviewer_ids": ["r1", "r2"]},
+          {"manuscript_id": "m3", "reviewer_ids": ["r1", "r2"]}
+        ],
+        "ballots": [
+          {"reviewer_id": "r1", "ranked_manuscript_ids": ["m1", "m2", "m3"]},
+          {"reviewer_id": "r2", "ranked_manuscript_ids": ["m3", "m1"]}
+        ]
+      }'
+# -> ranking = ["m1", "m2", "m3"]（m1 对 m2 支持 2；m2/m3 未同票，强度互相为 0，按 ID 破同）；
+#    pairwise_support 列出全部支持为正的有向对
 ```
 
 ## 算法与确定性
@@ -1217,6 +1341,15 @@ curl -s -X POST http://localhost:8000/review-clock \
   移动截止时刻；提交后工时、截止时刻与逾期判定冻结在提交时刻。重复配对、
   未知配对、同对同刻事件与非法状态转换收集为确定性排序的问题清单整体拒绝；
   计算全程整数秒、无时区与浮点歧义，相同事件集合（含乱序输入）结果完全相同。
+- 共识顺序（`/decision-ranking`）：先从严格排序票构造直接支持矩阵——每张票
+  只为其中**同时出现**的稿件对贡献 1 票（部分票不在未同票稿件间产生偏好），
+  `d[甲][乙]` 为把甲排在乙前的票数；仅成对胜者（`d[甲][乙] > d[乙][甲]`）的
+  直接支持作为有向边，成对平票两个方向均不成边；以 Floyd–Warshall 闭包求最强
+  路径强度 `s[甲][乙] = max_path min(沿途边权)`（min/max 格上的闭包，结果与
+  中间点遍历顺序无关），按 `s[甲][乙] > s[乙][甲]` 两两比较排序，无法区分时
+  按稿件 ID 升序破同，输出完整全序。非法投票（未知评审人 / 重复票 / 票内重复
+  稿件 / 稿件不属于其分配名单）收集为确定性排序的问题清单整体拒绝；分配关系
+  与票均按集合处理，输入列表重排不改变任何输出。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
@@ -1234,17 +1367,19 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock
+  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock、/decision-ranking
   models.py    # 请求/响应模型与校验
   solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 下限覆盖带下界流 + 分角色全局分配
   audit.py     # 资格审计：自稿/显式回避/主题匹配 + 无向合作图最短链（BFS 分层 + 完整 ID 序列字典序破同）
   clock.py     # 工时钟重放：工作日历（工作日 09:00-17:00 UTC、节假日排除）整数秒计时 + 状态机重放与截止时刻投影
+  ranking.py   # 共识顺序：Schulze 最强路径（成对胜者成边 + Floyd–Warshall 路径强度闭包 + ID 破同）与投票校验
 tests/
-  test_assign.py          # /assign 端到端测试
-  test_assign_coverage.py # /assign-coverage 端到端测试
-  test_assign_roles.py    # /assign-roles 端到端测试
-  test_conflict_audit.py  # /conflict-audit 端到端测试
-  test_review_clock.py    # /review-clock 端到端测试
+  test_assign.py            # /assign 端到端测试
+  test_assign_coverage.py   # /assign-coverage 端到端测试
+  test_assign_roles.py      # /assign-roles 端到端测试
+  test_conflict_audit.py    # /conflict-audit 端到端测试
+  test_review_clock.py      # /review-clock 端到端测试
+  test_decision_ranking.py  # /decision-ranking 端到端测试
 Dockerfile
 docker-compose.yml
 requirements.txt

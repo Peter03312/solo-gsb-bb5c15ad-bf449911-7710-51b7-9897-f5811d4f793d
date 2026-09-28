@@ -24,11 +24,16 @@ from .models import (
     CoverageAssignRequest,
     CoverageAssignResponse,
     CoverageConflictOut,
+    DecisionRankingError,
+    DecisionRankingIssueOut,
+    DecisionRankingRequest,
+    DecisionRankingResponse,
     IneligiblePairOut,
     LoadRatioOut,
     LockedConflictOut,
     ManuscriptAuditOut,
     ManuscriptRolesOut,
+    PairwiseSupportOut,
     ReviewClockError,
     ReviewClockPairOut,
     ReviewClockRequest,
@@ -43,6 +48,7 @@ from .models import (
     WorkloadBalanceOut,
 )
 from .audit import audit_conflicts
+from .ranking import RankingBallot, compute_ranking
 from .solver import (
     BottleneckCut,
     ManuscriptSpec,
@@ -54,7 +60,7 @@ from .solver import (
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
@@ -85,6 +91,11 @@ app = FastAPI(
         "评审人配对，按 UTC 事件（接受、暂停、恢复、提交）重放状态机，只在"
         "周一至周五 09:00—17:00 UTC 且非节假日累计工作时长，返回各对状态、"
         "已用/剩余工时、预计截止时刻与逾期判定。"
+        "支持稿件共识顺序（POST /decision-ranking）：接收 /assign 的可行分配名单"
+        "与评审人对已评稿件的严格排序票（每人一票、可只排部分稿件），按 Schulze "
+        "最强路径法汇总——仅成对胜者的直接支持可作路径边，路径强度取沿途最小"
+        "支持的最大值，强度大者在前、无法区分按稿件 ID 破同，返回完整共识顺序与"
+        "成对支持数；非法投票返回 422。"
         "服务无状态，不持久化任何稿件/评审信息。"
     ),
 )
@@ -504,5 +515,56 @@ def review_clock(req: ReviewClockRequest):
                 overdue=c.overdue,
             )
             for c in replay.results
+        ],
+    )
+
+
+@app.post(
+    "/decision-ranking",
+    response_model=DecisionRankingResponse,
+    tags=["decision-ranking"],
+    responses={422: {"model": DecisionRankingError}},
+)
+def decision_ranking(req: DecisionRankingRequest):
+    # /assign 可行名单：同一稿件多条目自动合并取并集
+    assignments = [
+        (a.manuscript_id, tuple(a.reviewer_ids)) for a in req.assignments
+    ]
+    ballots = [
+        RankingBallot(
+            reviewer_id=b.reviewer_id,
+            ranked_manuscript_ids=tuple(b.ranked_manuscript_ids),
+        )
+        for b in req.ballots
+    ]
+
+    result = compute_ranking(assignments, ballots)
+    if result.issues:
+        # 未知评审人 / 重复票 / 票内重复稿件 / 稿件不属于其分配名单：
+        # 整体拒绝，不输出任何顺序
+        return JSONResponse(
+            status_code=422,
+            content=DecisionRankingError(
+                errors=[
+                    DecisionRankingIssueOut(
+                        type=i.type,
+                        reviewer_id=i.reviewer_id,
+                        manuscript_id=i.manuscript_id,
+                        detail=i.detail,
+                    )
+                    for i in result.issues
+                ]
+            ).model_dump(mode="json"),
+        )
+
+    return DecisionRankingResponse(
+        ranking=list(result.ranking),
+        pairwise_support=[
+            PairwiseSupportOut(
+                manuscript_id=p.manuscript_id,
+                over_manuscript_id=p.over_manuscript_id,
+                support=p.support,
+            )
+            for p in result.pairwise_support
         ],
     )

@@ -599,3 +599,86 @@ class ReviewClockError(BaseModel):
     """请求被拒绝（422）：结构化问题清单，clocks 不输出。"""
 
     errors: list[ClockIssueOut]
+
+
+# ---------- POST /decision-ranking：Schulze 共识顺序 ----------
+
+
+class DecisionAssignmentIn(BaseModel):
+    """一组「稿件 -> 评审人」关系（/assign 可行分配名单）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    manuscript_id: str = Field(min_length=1, max_length=128, description="稿件 ID")
+    reviewer_ids: list[str] = Field(
+        min_length=1, max_length=10000,
+        description="该稿件的已分配评审人 ID 列表（同一稿件多条目自动合并取并集）",
+    )
+
+
+class DecisionBallotIn(BaseModel):
+    """一张评审人严格排序票：ranked_manuscript_ids 从前到后即从优到劣。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reviewer_id: str = Field(min_length=1, max_length=128, description="投票评审人 ID")
+    ranked_manuscript_ids: list[str] = Field(
+        default_factory=list,
+        max_length=10000,
+        description=(
+            "严格排序的稿件 ID（靠前=更优）；可只排其分配名单内的部分稿件，"
+            "空列表视为弃权；未同时出现在同票的两稿不计入成对支持"
+        ),
+    )
+
+
+class DecisionRankingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assignments: list[DecisionAssignmentIn] = Field(
+        min_length=1, max_length=10000,
+        description="/assign 求出的可行分配名单（稿件 -> 评审人）",
+    )
+    ballots: list[DecisionBallotIn] = Field(
+        default_factory=list, max_length=10000,
+        description="评审人严格排序票；每人最多一票，可只排部分稿件（空列表弃权）",
+    )
+
+
+DecisionRankingIssueType = Literal[
+    "unknown_reviewer",
+    "duplicate_ballot",
+    "duplicate_manuscript_in_ballot",
+    "manuscript_not_assigned",
+]
+
+
+class DecisionRankingIssueOut(BaseModel):
+    """一条非法投票原因（整体 422 时返回全部问题，不输出顺序）。"""
+
+    type: DecisionRankingIssueType
+    reviewer_id: str | None = None
+    manuscript_id: str | None = None
+    detail: str
+
+
+class PairwiseSupportOut(BaseModel):
+    """一个有向稿件对的直接支持数：support 张票把 manuscript_id 排在 over 之前。"""
+
+    manuscript_id: str
+    over_manuscript_id: str
+    support: int
+
+
+class DecisionRankingResponse(BaseModel):
+    # 共识完整顺序（含未获票的稿件，路径强度无法区分时按稿件 ID 升序破同）
+    ranking: list[str]
+    # 全部直接支持为正的有向对（按 (manuscript_id, over_manuscript_id) 字典序）；
+    # 未列出的有向对支持数为 0
+    pairwise_support: list[PairwiseSupportOut]
+
+
+class DecisionRankingError(BaseModel):
+    """请求被拒绝（422）：结构化非法投票清单，ranking 不输出。"""
+
+    errors: list[DecisionRankingIssueOut]

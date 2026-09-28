@@ -64,6 +64,16 @@ UTC 时刻与是否逾期（暂停中截止时刻为空，提交后按提交时�
 评审人 ID 排序。重复配对、未知配对、同对同刻事件与非法状态转换一律返回 `422` 与
 结构化问题清单，不输出任何钟结果。
 
+`POST /decision-ranking` 提供**稿件共识排序**：接收 `/assign` 的可行分配名单与评审人
+对其**已评稿件**的严格排序票，按 **Schulze 最强路径法**生成稿件共识顺序。每位评审人
+最多一票；票内稿件不得重复且必须属于其分配名单；允许只排部分稿件，**未同时出现在
+同一张票中的两稿不计入成对支持**。直接支持为将甲排在乙前的票数，**仅成对胜者
+（`d[甲][乙] > d[乙][甲]`）的直接支持可作为路径边**，路径强度取沿途最小支持的最大值；
+甲对乙的路径强度较大时甲排在前，无法区分时按稿件 ID 破同。响应返回覆盖名单中全部
+稿件的确定完整顺序与全部有序稿件对的成对支持数；输入列表重排不改变结果，非法投票
+（一人多票 / 票内重复 / 稿件不属于其分配名单）返回 `422` 与结构化问题清单，不输出
+任何排序结果。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -84,6 +94,7 @@ curl 直接访问 <http://localhost:8000> 即可（根路径返回服务信息�
 | http://localhost:8000/assign-roles | 分角色分配接口（POST） |
 | http://localhost:8000/conflict-audit | 资格审计接口（POST，只读） |
 | http://localhost:8000/review-clock | 评审工时钟重放接口（POST） |
+| http://localhost:8000/decision-ranking | 稿件共识排序接口（POST，Schulze 最强路径） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/redoc | ReDoc 文档 |
 
@@ -990,6 +1001,121 @@ pending ──accept──▶ active ──pause──▶ paused ──resume─
 下班后、周末或节假日）时，计时段起点钳制到其后第一个工作瞬间（通常为当天/次一
 工作日 09:00）。
 
+### `POST /decision-ranking`（稿件共识排序）
+
+接收 `/assign` 的**可行分配名单**与评审人对其**已评稿件**的严格排序票，按
+**Schulze 最强路径法（Schulze method）**在全部稿件上生成确定性的共识顺序。
+接口本身不做分配计算（名单由调用方从 `/assign` 响应取得），服务无状态。
+
+投票规则：
+
+- **每位评审人最多一票**：同一 `reviewer_id` 出现两张票即非法
+  （`duplicate_ballot`）。
+- **票内稿件不得重复**（`duplicate_manuscript`），且每一篇都**必须属于该评审人的
+  分配名单**（`manuscript_not_assigned`）；评审人只能对自己被分到的稿件投票。
+- **允许只排部分稿件**：`ranking` 是严格的线性顺序（靠前 = 更偏好），未排出的稿件
+  不参与该票的任何成对比较；空列表 `[]` 等价于不投票。
+- **两稿仅在同一张票中同时出现时才计入成对支持**：某票未同时排出甲、乙，则该票
+  既不支持甲在前，也不支持乙在前（区别于「未排 = 垫底」的计法）。
+
+Schulze 最强路径（严格按以下规则）：
+
+1. **直接成对支持** `d[甲][乙]` = 将甲排在乙之前的票数（两稿须同时出现在该票中）。
+2. **路径边**：仅当 `d[甲][乙] > d[乙][甲]`（甲是该成对比较的胜者）时，
+   `甲 → 乙` 才作为一条边，边权为 `d[甲][乙]`；成对平局或负方的直接支持
+   **不得作为路径边**。
+3. **路径强度**：一条路径的强度 = 沿途各边边权的**最小值**；甲对乙的路径强度
+   `p[甲][乙]` 是甲到乙**全部路径强度的最大值**（最宽路径，用 Floyd-Warshall 计算）。
+4. **共识序**：以 `p[甲][乙] > p[乙][甲]`（甲严格强于乙）为有向边构成**无环有向图**
+   （DAG），在其上取**按稿件 ID 破同的拓扑序**——每一步都在当前零入度（已无更强者
+   在前）的稿件中选**稿件 ID 最小**者输出（min-heap Kahn）。因此：
+   - 任一严格强于关系 `p[甲][乙] > p[乙][甲]` 都保证甲排在乙前（拓扑序的线性扩张）；
+   - 无严格关系（路径强度无法区分）的稿件之间，由「谁先成为零入度候选、同批取最小
+     ID」确定性破同；在两人全程势均力敌的常见情形下即退化为稿件 ID 升序。
+
+   注意部分票会让「无差异」关系本身**不传递**（可能 `p[甲][丙] == p[丙][甲]`、
+   `p[丙][乙] == p[乙][丙]` 但 `p[甲][乙] > p[乙][甲]`），故不能把「逐对比较路径
+   强度、相等再比 ID」直接当作通用排序的比较器（会形成比较器环而漏排）；按 ID
+   破同的拓扑序是满足全部严格强于关系的确定线性扩张，全票（每票排出全部稿件）时
+   与通常 Schulze 排序结果一致。
+
+请求体：
+
+```json
+{
+  "assignments": [
+    {"manuscript_id": "m1", "reviewer_ids": ["r1", "r2", "r3"]},
+    {"manuscript_id": "m2", "reviewer_ids": ["r1", "r2", "r3"]},
+    {"manuscript_id": "m3", "reviewer_ids": ["r1", "r2", "r3"]}
+  ],
+  "ballots": [
+    {"reviewer_id": "r1", "ranking": ["m1", "m2", "m3"]},
+    {"reviewer_id": "r2", "ranking": ["m2", "m3", "m1"]},
+    {"reviewer_id": "r3", "ranking": ["m3", "m1", "m2"]}
+  ]
+}
+```
+
+字段规则：
+
+- `assignments`（必填，可为空列表）：`/assign` 可行响应的 `assignments` 字段
+  （`稿件 -> 评审人 ID 列表`）；条目与评审人重复自动去重，`reviewer_ids` 可为空
+  列表（该稿本轮无人可评，但仍参与最终排序）。
+- `ballots`（可选，缺省为空）：元素为 `{reviewer_id, ranking}`；`ranking` 为从最前
+  到最后的稿件 ID 列表，允许只排部分稿件，空列表等价于不投票。
+- 任何模式级校验问题（见下表）均返回 `422`，问题一次性收集、按
+  `(type, reviewer_id, manuscript_id)` 确定性排序，**不输出任何排序结果**：
+
+| 问题类型 | 含义 |
+| --- | --- |
+| `duplicate_ballot` | 同一评审人提交了多张票（每人最多一票） |
+| `duplicate_manuscript` | 票内某稿件 ID 重复出现（严格票不得重复） |
+| `manuscript_not_assigned` | 票内稿件不在该评审人的可行分配名单中（含评审人不在任何名单中） |
+
+可行时响应（`200`）：`ranking` 为覆盖 `assignments` 中**全部稿件**（每篇恰好一次）
+的共识完整顺序；`pair_support` 列出全部**有序稿件对**（`a != b`，不含对角）的直接
+成对支持数 `support`，按 `(manuscript_id_a, manuscript_id_b)` 排序。相同业务输入
+（含名单、票、稿件顺序任意重排与重复去重）必然产生逐字节相同的输出：
+
+```json
+{
+  "ranking": ["m1", "m2", "m3"],
+  "pair_support": [
+    {"manuscript_id_a": "m1", "manuscript_id_b": "m2", "support": 2},
+    {"manuscript_id_a": "m1", "manuscript_id_b": "m3", "support": 1},
+    {"manuscript_id_a": "m2", "manuscript_id_b": "m1", "support": 1},
+    {"manuscript_id_a": "m2", "manuscript_id_b": "m3", "support": 2},
+    {"manuscript_id_a": "m3", "manuscript_id_b": "m1", "support": 2},
+    {"manuscript_id_a": "m3", "manuscript_id_b": "m2", "support": 1}
+  ]
+}
+```
+
+上例为 3 张全序票的循环：`d` 矩阵为每张票贡献一条严格序，三方成对支持均为
+`2:1`、胜者边成环（`m1→m2`、`m2→m3`、`m3→m1`，边权皆 2）；任意一方的最强路径
+强度也皆为 2（沿环上的两步路径 `min(2,2)=2`），路径无法区分，按稿件 ID 升序得
+`m1, m2, m3`。最强路径在更一般的例子中会打破「仅看直接多数」的循环：若甲直接小负
+于乙、但甲经丙到乙的最宽路径强于乙到甲的最强路径，则甲仍排在乙前。
+
+无票（`ballots` 为空或仅含空票）时全部路径强度为 0，共识顺序完全由稿件 ID 升序给出；
+只排一篇的票不产生任何成对支持，该稿与未被同票比较的稿件之间同样由 ID 破同。
+
+被拒绝时响应（`422`，与请求体字段错误的 FastAPI 校验响应同为 422，但本结构为
+`errors` 数组）：
+
+```json
+{
+  "errors": [
+    {
+      "type": "manuscript_not_assigned",
+      "reviewer_id": "r9",
+      "manuscript_id": "m2",
+      "detail": "稿件 m2 不在评审人 r9 的可行分配名单中，评审人只能对分配给自己的稿件投票"
+    }
+  ]
+}
+```
+
 ### 示例调用
 
 ```bash
@@ -1152,6 +1278,24 @@ curl -s -X POST http://localhost:8000/review-clock \
       }'
 # -> status=active，worked_hours=3（周一 2h + 周二 1h，暂停与夜间不计）；
 #    恢复时剩 8h，周二计 7h 后跨节假日（周三）顺延，deadline=2026-09-24T10:00:00Z
+
+# 共识排序：Schulze 最强路径，部分票只对同票出现的两稿计支持，平局按稿件 ID 破同
+curl -s -X POST http://localhost:8000/decision-ranking \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "assignments": [
+          {"manuscript_id": "m1", "reviewer_ids": ["r1", "r2", "r3"]},
+          {"manuscript_id": "m2", "reviewer_ids": ["r1", "r2", "r3"]},
+          {"manuscript_id": "m3", "reviewer_ids": ["r1", "r2", "r3"]}
+        ],
+        "ballots": [
+          {"reviewer_id": "r1", "ranking": ["m1", "m2"]},
+          {"reviewer_id": "r2", "ranking": ["m2"]},
+          {"reviewer_id": "r3", "ranking": ["m3", "m1"]}
+        ]
+      }'
+# -> ranking = ["m3", "m1", "m2"]（m3>m1 与 m1>m2 各 1 票；m2 与 m3 从未同票，
+#    双向支持均为 0）；pair_support 给出全部有序稿件对的直接支持数
 ```
 
 ## 算法与确定性
@@ -1217,6 +1361,20 @@ curl -s -X POST http://localhost:8000/review-clock \
   移动截止时刻；提交后工时、截止时刻与逾期判定冻结在提交时刻。重复配对、
   未知配对、同对同刻事件与非法状态转换收集为确定性排序的问题清单整体拒绝；
   计算全程整数秒、无时区与浮点歧义，相同事件集合（含乱序输入）结果完全相同。
+- 共识排序（`/decision-ranking`）：先把 `/assign` 名单去重为「评审人 -> 被分稿件
+  集合」，逐票做模式校验（每张票都完整校验：每人一票、票内无重复、每稿属于其分配
+  名单），问题按 `(type, reviewer_id, manuscript_id)` 收集排序后整体拒绝（422），
+  不输出排序结果。通过校验后按票的严格序累加直接成对支持 `d[i][j]`（仅两稿同票
+  出现时靠前者得一票，故部分票天然不给未同票比较的两稿任何支持）；路径强度矩阵 `p`
+  初始仅在 `d[i][j] > d[j][i]`（成对胜者）时置为 `d[i][j]`，其余为 0（不存在边），
+  再以 Floyd-Warshall 对全部 `(k,i,j)` 三元组做最宽路径松弛
+  `p[i][j] = max_k min(p[i][k], p[k][j])`（不跳过 `i/j` 相同的三元组，否则会漏掉
+  合法链式最强路径）。严格偏好 `p[i][j] > p[j][i]` 构成无环有向图：部分票下「无差异」
+  关系可能不传递，故最终顺序不是逐对比较器排序，而是在该 DAG 上用 **min-heap
+  Kahn** 取按稿件 ID 破同的拓扑序（每步在零入度稿件中输出 ID 最小者）——保持全部
+  严格强于关系、势均力敌者由 ID 确定破同；全票时与通常 Schulze 排序一致。成对支持
+  只取决于票集合，稿件、票、评审人列表任意重排以及名单/票内重复均产生逐字节相同的
+  结果（全程整数运算）。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
@@ -1234,17 +1392,19 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock
+  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock、/decision-ranking
   models.py    # 请求/响应模型与校验
   solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 下限覆盖带下界流 + 分角色全局分配
   audit.py     # 资格审计：自稿/显式回避/主题匹配 + 无向合作图最短链（BFS 分层 + 完整 ID 序列字典序破同）
   clock.py     # 工时钟重放：工作日历（工作日 09:00-17:00 UTC、节假日排除）整数秒计时 + 状态机重放与截止时刻投影
+  ranking.py   # 共识排序：直接成对支持 + Schulze 最强路径（仅胜者边，Floyd-Warshall 最宽路径）+ 路径强度/ID 破同
 tests/
-  test_assign.py          # /assign 端到端测试
-  test_assign_coverage.py # /assign-coverage 端到端测试
-  test_assign_roles.py    # /assign-roles 端到端测试
-  test_conflict_audit.py  # /conflict-audit 端到端测试
-  test_review_clock.py    # /review-clock 端到端测试
+  test_assign.py            # /assign 端到端测试
+  test_assign_coverage.py   # /assign-coverage 端到端测试
+  test_assign_roles.py      # /assign-roles 端到端测试
+  test_conflict_audit.py    # /conflict-audit 端到端测试
+  test_review_clock.py      # /review-clock 端到端测试
+  test_decision_ranking.py  # /decision-ranking 端到端测试
 Dockerfile
 docker-compose.yml
 requirements.txt

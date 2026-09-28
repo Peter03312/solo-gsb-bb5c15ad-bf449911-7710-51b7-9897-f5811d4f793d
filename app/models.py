@@ -599,3 +599,93 @@ class ReviewClockError(BaseModel):
     """请求被拒绝（422）：结构化问题清单，clocks 不输出。"""
 
     errors: list[ClockIssueOut]
+
+
+# ---------- POST /decision-ranking：Schulze 共识排序 ----------
+
+DecisionRankingIssueType = Literal[
+    "duplicate_ballot",
+    "duplicate_manuscript",
+    "manuscript_not_assigned",
+]
+
+
+class RankingAssignmentIn(BaseModel):
+    """一条「稿件 -> 评审人」可行分配关系（取自 /assign 响应，重复项自动去重）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    manuscript_id: str = Field(min_length=1, max_length=128, description="稿件 ID")
+    reviewer_ids: list[str] = Field(
+        max_length=10000,
+        description=(
+            "该稿件的评审人 ID 列表（取自 /assign 的可行分配，重复项自动去重）；"
+            "可为空列表，表示该稿本轮无人可评"
+        ),
+    )
+
+
+class RankingBallotIn(BaseModel):
+    """一位评审人对其已评稿件的严格排序票（最前 -> 最后）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reviewer_id: str = Field(min_length=1, max_length=128, description="投票评审人 ID")
+    ranking: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        max_length=10000,
+        description=(
+            "按严格偏好从最前到最后排列的稿件 ID 列表：允许只排部分稿件；"
+            "票内稿件不得重复，且每一篇都必须属于该评审人的分配名单。"
+            "两稿仅在同一张票中同时出现时才计入成对支持；空列表等于不投票"
+        ),
+    )
+
+
+class DecisionRankingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assignments: list[RankingAssignmentIn] = Field(
+        max_length=10000,
+        description=(
+            "/assign 可行分配名单（稿件 -> 评审人列表）；条目与评审人重复自动去重。"
+            "允许为空列表（此时共识顺序与成对支持均为空）"
+        ),
+    )
+    ballots: list[RankingBallotIn] = Field(
+        default_factory=list, max_length=10000,
+        description=(
+            "评审人严格排序票列表；每位评审人最多一票，票内稿件不得重复且必须"
+            "属于其分配名单，缺省为空列表（无票时共识顺序完全由稿件 ID 破同）"
+        ),
+    )
+
+
+class RankingIssueOut(BaseModel):
+    """一条非法投票原因（整体 422 时返回全部问题，不输出任何排序结果）。"""
+
+    type: DecisionRankingIssueType
+    reviewer_id: str
+    # duplicate_ballot 时为 null；其余携带问题稿件 ID
+    manuscript_id: str | None = None
+    detail: str
+
+
+class DecisionRankingError(BaseModel):
+    """请求被拒绝（422）：结构化问题清单，不输出共识顺序。"""
+
+    errors: list[RankingIssueOut]
+
+
+class PairSupportOut(BaseModel):
+    """一个有序稿件对的直接成对支持：将 manuscript_id_a 排在 manuscript_id_b 前的票数。"""
+
+    manuscript_id_a: str
+    manuscript_id_b: str
+    support: int
+
+
+class DecisionRankingResponse(BaseModel):
+    # 共识顺序（第一名 -> 最后一名），覆盖分配名单中的全部稿件
+    ranking: list[str]
+    # 全部有序稿件对 (a != b) 的直接成对支持，按 (manuscript_id_a, manuscript_id_b) 排序
+    pair_support: list[PairSupportOut]

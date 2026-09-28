@@ -24,16 +24,21 @@ from .models import (
     CoverageAssignRequest,
     CoverageAssignResponse,
     CoverageConflictOut,
+    DecisionRankingError,
+    DecisionRankingRequest,
+    DecisionRankingResponse,
     IneligiblePairOut,
     LoadRatioOut,
     LockedConflictOut,
     ManuscriptAuditOut,
     ManuscriptRolesOut,
+    PairSupportOut,
     ReviewClockError,
     ReviewClockPairOut,
     ReviewClockRequest,
     ReviewClockResponse,
     ReviewerShortfallOut,
+    RankingIssueOut,
     RoleAssignRequest,
     RoleAssignResponse,
     RoleAssignmentOut,
@@ -43,6 +48,7 @@ from .models import (
     WorkloadBalanceOut,
 )
 from .audit import audit_conflicts
+from .ranking import RankingBallot, schulze_rank
 from .solver import (
     BottleneckCut,
     ManuscriptSpec,
@@ -54,7 +60,7 @@ from .solver import (
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
@@ -85,6 +91,10 @@ app = FastAPI(
         "评审人配对，按 UTC 事件（接受、暂停、恢复、提交）重放状态机，只在"
         "周一至周五 09:00—17:00 UTC 且非节假日累计工作时长，返回各对状态、"
         "已用/剩余工时、预计截止时刻与逾期判定。"
+        "支持共识排序（POST /decision-ranking）：接收 /assign 的可行分配名单"
+        "与评审人对已评稿件的严格排序票，按 Schulze 最强路径法（仅成对胜者的"
+        "直接支持可作为路径边，路径强度取沿途最小支持的最大值）生成稿件共识"
+        "顺序，路径强度无法区分时按稿件 ID 破同，返回完整顺序与成对支持数。"
         "服务无状态，不持久化任何稿件/评审信息。"
     ),
 )
@@ -504,5 +514,54 @@ def review_clock(req: ReviewClockRequest):
                 overdue=c.overdue,
             )
             for c in replay.results
+        ],
+    )
+
+
+@app.post(
+    "/decision-ranking",
+    response_model=DecisionRankingResponse,
+    tags=["decision-ranking"],
+    responses={422: {"model": DecisionRankingError}},
+)
+def decision_ranking(req: DecisionRankingRequest):
+    # /assign 名单：稿件 -> 评审人集合。注意不能复用 _to_pair_set（后者展开为
+    # (稿件, 评审人) 对集合，会把 reviewer_ids 为空列表的稿件整条丢掉）；本接口
+    # 必须保留「无人可评」的稿件——它仍参与共识顺序。条目与评审人重复自动去重。
+    assignments = [
+        (a.manuscript_id, list(set(a.reviewer_ids))) for a in req.assignments
+    ]
+    ballots = [
+        RankingBallot(reviewer_id=b.reviewer_id, ranking=tuple(b.ranking))
+        for b in req.ballots
+    ]
+
+    result = schulze_rank(assignments, ballots)
+    if result.issues:
+        # 每人多票 / 票内重复 / 稿件不属于其分配名单：整体拒绝，不输出任何排序结果
+        return JSONResponse(
+            status_code=422,
+            content=DecisionRankingError(
+                errors=[
+                    RankingIssueOut(
+                        type=i.type,
+                        reviewer_id=i.reviewer_id,
+                        manuscript_id=i.manuscript_id,
+                        detail=i.detail,
+                    )
+                    for i in result.issues
+                ]
+            ).model_dump(mode="json"),
+        )
+
+    return DecisionRankingResponse(
+        ranking=list(result.order),
+        pair_support=[
+            PairSupportOut(
+                manuscript_id_a=p.manuscript_id_a,
+                manuscript_id_b=p.manuscript_id_b,
+                support=p.support,
+            )
+            for p in result.pair_support
         ],
     )
